@@ -6,7 +6,7 @@ require('dotenv').config();
 
 const app = express();
 const PORT = 3001;  // Fallback port
-const DELAY_SECONDS = 20 * 1000;  // 30 seconds in milliseconds
+const FOLLOW_UP_TIME_LIMIT = 5 * 1000; // 10 seconds time limit for follow-up emails
 
 // Middleware
 app.use(cors());
@@ -20,7 +20,7 @@ mongoose.connect(process.env.MONGO_URI)
 // Updated email schema with 'isComingSoon' field
 const emailSchema = new mongoose.Schema({
     email: { type: String, required: true, unique: true },
-    isComingSoon: { type: Boolean, default: true }  // Initially set to false
+    isComingSoon: { type: Boolean, default: true }  // Initially set to true
 });
 
 const Subscriber = mongoose.model('Subscriber', emailSchema);
@@ -36,7 +36,6 @@ const transporter = nodemailer.createTransport({
     }
 });
 
-
 // API route for subscribing
 app.post('/api/subscribe', async (req, res) => {
     const { email } = req.body;
@@ -46,7 +45,7 @@ app.post('/api/subscribe', async (req, res) => {
     }
 
     try {
-        // Save email to database with isComingSoon = false by default
+        // Save email to database with isComingSoon = true by default
         const newSubscriber = new Subscriber({ email });
         await newSubscriber.save();
 
@@ -68,8 +67,13 @@ app.post('/api/subscribe', async (req, res) => {
         };
 
         // Sending the email
-        const info = await transporter.sendMail(mailOptions);
-        console.log('Confirmation email sent:', info.response);
+        await transporter.sendMail(mailOptions);
+        console.log('Confirmation email sent:', mailOptions.to);
+
+        // Trigger follow-up email after a delay of 10 seconds
+        setTimeout(() => {
+            sendLiveNotificationEmails(newSubscriber.email);
+        }, FOLLOW_UP_TIME_LIMIT);
 
         return res.status(200).json({ message: 'Subscription successful, confirmation email sent.' });
 
@@ -82,18 +86,27 @@ app.post('/api/subscribe', async (req, res) => {
     }
 });
 
-
 // Function to send the "Website Live" email
-const sendLiveNotificationEmails = async () => {
+const sendLiveNotificationEmails = async (startTime) => {
     try {
-        const subscribers = await Subscriber.find({ isComingSoon: true });  // Only send to those with isComingSoon = true
+        const subscribers = await Subscriber.find({ isComingSoon: true });
+
+        const currentTime = Date.now();
+        const timeElapsed = currentTime - startTime;
+
+        if (timeElapsed > FOLLOW_UP_TIME_LIMIT) {
+            console.log(`Time limit exceeded. Skipping follow-up emails.`);
+            return;
+        }
 
         for (const subscriber of subscribers) {
-            const followUpMailOptions = {
-                from: `StyleHub <${process.env.EMAIL}>`,
-                to: subscriber.email,
-                subject: 'Important Update: Website is Now Live!',
-                text: `Dear User,
+            // Check if the follow-up email has already been sent
+            if (!subscriber.followUpEmailSent) {
+                const followUpMailOptions = {
+                    from: `StyleHub <${process.env.EMAIL}>`,
+                    to: subscriber.email,
+                    subject: 'Important Update: Website is Now Live!',
+                    text: `Dear User,
 
 I hope this message finds you well.
 
@@ -105,17 +118,18 @@ Thank you for being a valued subscriber, and we look forward to serving you bett
 
 Best regards,
 StyleHub Team`
-            };
+                };
 
-            // Send the follow-up email
-            await transporter.sendMail(followUpMailOptions);
-            console.log(`Follow-up email sent to: ${subscriber.email}`);
+                // Send the follow-up email
+                await transporter.sendMail(followUpMailOptions);
+                console.log(`Follow-up email sent to: ${subscriber.email}`);
 
-            // Update the subscriber's 'isComingSoon' status to false
-            await Subscriber.findOneAndUpdate(
-                { email: subscriber.email },
-                { isComingSoon: false }
-            );
+                // Update the subscriber's 'isComingSoon' status to false and set followUpEmailSent to true
+                await Subscriber.findOneAndUpdate(
+                    { email: subscriber.email },
+                    { isComingSoon: false, followUpEmailSent: true }
+                );
+            }
         }
 
         console.log('All follow-up emails sent.');
@@ -124,19 +138,6 @@ StyleHub Team`
         console.error('Error while sending follow-up emails:', error);
     }
 };
-
-
-
-// Function to trigger email sending after 30-second delay
-const startDelayedEmails = () => {
-    console.log(`Waiting for ${DELAY_SECONDS / 1000} seconds before sending emails...`);
-    setTimeout(() => {
-        sendLiveNotificationEmails();
-    }, DELAY_SECONDS);
-};
-
-// Trigger the delayed email sending (e.g., after the server starts or based on a specific action)
-startDelayedEmails();
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -153,16 +154,59 @@ app.listen(PORT, () => {
 // API route to check if the site is live
 app.get('/api/site-status', async (req, res) => {
     try {
-      // Check if any subscribers have isComingSoon set to false
-      const liveSubscribers = await Subscriber.find({ isComingSoon: false });
-      
-      // If any subscribers have isComingSoon: false, the site is live
-      const siteLive = liveSubscribers.length > 0;
-  
-      res.status(200).json({ siteLive });
+        // Check if any subscribers have isComingSoon set to false
+        const liveSubscribers = await Subscriber.find({ isComingSoon: false });
+        
+        // If any subscribers have isComingSoon: false, the site is live
+        const siteLive = liveSubscribers.length > 0;
+
+        res.status(200).json({ siteLive });
     } catch (error) {
-      console.error('Error fetching site status:', error);
-      res.status(500).json({ error: 'Server error' });
+        console.error('Error fetching site status:', error);
+        res.status(500).json({ error: 'Server error' });
     }
-  });
-  
+});
+
+app.post('/api/unsubscribe', async (req, res) => {
+    const { email } = req.body;
+
+    try {
+        // Remove user from the database
+        const result = await User.deleteOne({ email });
+
+        if (result.deletedCount > 0) {
+            return res.json({ success: true });
+        } else {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+    } catch (error) {
+        console.error('Error unsubscribing:', error);
+        return res.status(500).json({ error: 'An error occurred while unsubscribing.' });
+    }
+});
+
+// API route to check if the email has access
+app.post('/api/check-access', async (req, res) => {
+    const { email } = req.body;
+
+    if (!email) {
+        return res.status(400).json({ error: 'Email is required' });
+    }
+
+    try {
+        const subscriber = await Subscriber.findOne({ email });
+        const siteLive = await Subscriber.find({ isComingSoon: false }).countDocuments() > 0;
+
+        if (subscriber) {
+            // Check if the subscriber has access
+            const hasAccess = subscriber.isComingSoon === false;
+            return res.status(200).json({ hasAccess, siteLive });
+        } else {
+            return res.status(200).json({ hasAccess: false, siteLive });
+        }
+    } catch (error) {
+        console.error('Error checking access:', error);
+        return res.status(500).json({ error: 'Server error' });
+    }
+});
+
